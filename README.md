@@ -98,7 +98,7 @@ Reglas de oro:
 2. Actualizar el secreto (`base_url`, credenciales, `verify_ssl: false` por el certificado self-signed del appliance) y el `entities.yaml` al perfil S/4HANA. Ojo: cada API es un servicio OData distinto — el handler debe iterar una config por servicio o consolidarse con un `base_url` por entidad (ejercicio de mejora para el junior: mover `base_url` adentro de cada entrada del YAML).
 3. `FULL_LOAD=true` para la carga inicial; después volver a incremental.
 4. Correr todo el flujo aguas abajo. Acá aparecen las rarezas SAP DE VERDAD (fechas, ALPHA, signos): verificar que STAGING las limpia y que la Fase 3 encuarentena lo que corresponde.
-5. Nota de alcance: el appliance no trae la "transacción Z de Montana" ni el Excel de presupuesto; el presupuesto se simula subiendo un parquet a mano al prefijo `budget/` (agregar el pipe correspondiente: ejercicio).
+5. Nota de alcance: el appliance no trae la "transacción Z" ni el Excel de presupuesto; el presupuesto se simula subiendo un parquet a mano al prefijo `budget/` (agregar el pipe correspondiente: ejercicio).
    ✅ Criterio de salida: mismo end-to-end pero con S/4HANA como fuente. **Hito principal de toda la práctica.**
 
 ### Etapa E — Fase 3 y ML sobre datos reales (~3 días)
@@ -115,9 +115,9 @@ Re-ejecutar 05 y 06 con los datos del CAL. Documentar en un doc corto: cuántos 
 
 ---
 
-## 4. Qué queda listo si Montana firma
+## 4. Qué queda listo
 
-Al completar A–F, el día uno de la Fase 2 real se tiene: extractor probado contra un S/4HANA verdadero, infra de ambas nubes como scripts reproducibles, warehouse completo con Fase 3 y ML, y un junior (o el DE contratado) que ya recorrió cada pieza. Los deltas contra el proyecto real: confirmar qué CDS views están liberadas y son Delta-Enabled en el sistema de Montana (Fase 1, contra el Order Form), la transacción Z (requiere su propio servicio OData o CDS custom — se diseña en Fase 1), el Excel de presupuesto real, y ambientes DEV → PROD (duplicar database + warehouse; trivial con estos scripts porque todo es código).
+Al completar A–F, el día uno de la Fase 2 real se tiene: extractor probado contra un S/4HANA verdadero, infra de ambas nubes como scripts reproducibles, warehouse completo con Fase 3 y ML, y un junior (o el DE contratado) que ya recorrió cada pieza. Los deltas contra el proyecto real: confirmar qué CDS views están liberadas y son Delta-Enabled en el sistema del cliente  (Fase 1, contra el Order Form), la transacción Z (requiere su propio servicio OData o CDS custom — se diseña en Fase 1), el Excel de presupuesto real, y ambientes DEV → PROD (duplicar database + warehouse; trivial con estos scripts porque todo es código).
 
 ## 5. Rama Databricks (🏛 Simón) — mapa de porteo
 
