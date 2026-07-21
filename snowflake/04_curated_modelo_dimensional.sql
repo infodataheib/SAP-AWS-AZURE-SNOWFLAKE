@@ -1,0 +1,242 @@
+-- ============================================================
+-- 04 · CURATED — Modelo dimensional Comercial (Kimball / Star Schema)
+--   DIM_DATE · DIM_CUSTOMER (SCD2) · DIM_PRODUCT (SCD2) · DIM_SALES_ORG
+--   FACT_SALES_ORDERS · FACT_BILLING · FACT_BUDGET
+-- Igual al modelo de la sección 6 de la propuesta.
+-- ============================================================
+
+USE ROLE SYSADMIN;
+USE WAREHOUSE WH_DEMO;
+USE SCHEMA DWH_DEMO.CURATED;
+
+-- -----------------------------------------------------------
+-- 4.1 DIM_DATE (calendario 2023 → año próximo)
+-- -----------------------------------------------------------
+CREATE OR REPLACE TABLE DIM_DATE AS
+SELECT
+    TO_NUMBER(TO_CHAR(d, 'YYYYMMDD'))       AS DATE_SK,
+    d                                        AS FULL_DATE,
+    YEAR(d)                                  AS YEAR,
+    QUARTER(d)                               AS QUARTER,
+    MONTH(d)                                 AS MONTH,
+    MONTHNAME(d)                             AS MONTH_NAME,
+    WEEKOFYEAR(d)                            AS WEEK_OF_YEAR,
+    DAYOFWEEKISO(d)                          AS DAY_OF_WEEK,
+    IFF(DAYOFWEEKISO(d) >= 6, TRUE, FALSE)   AS IS_WEEKEND
+FROM (
+    SELECT DATEADD(day, SEQ4(), '2023-01-01'::DATE) AS d
+    FROM TABLE(GENERATOR(ROWCOUNT => 1830))
+)
+WHERE d <= DATEADD(year, 1, CURRENT_DATE);
+
+-- -----------------------------------------------------------
+-- 4.2 DIM_CUSTOMER — SCD Tipo 2
+-- -----------------------------------------------------------
+CREATE OR REPLACE TABLE DIM_CUSTOMER (
+    CUSTOMER_SK     NUMBER IDENTITY,
+    CUSTOMER_ID     VARCHAR       NOT NULL,   -- clave natural
+    CUSTOMER_NAME   VARCHAR,
+    TAX_ID          VARCHAR,                  -- PII → masking en Fase 3
+    EMAIL           VARCHAR,                  -- PII → masking en Fase 3
+    CITY            VARCHAR,
+    REGION          VARCHAR,
+    COUNTRY         VARCHAR,
+    CUSTOMER_GROUP  VARCHAR,
+    CREATED_DATE    DATE,
+    ROW_HASH        VARCHAR,
+    VALID_FROM      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    VALID_TO        TIMESTAMP_NTZ DEFAULT '9999-12-31'::TIMESTAMP_NTZ,
+    IS_CURRENT      BOOLEAN       DEFAULT TRUE,
+    -- auditoría (patrón de Fase 3, presente desde el día uno)
+    _CREATED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _UPDATED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Carga inicial
+INSERT INTO DIM_CUSTOMER (CUSTOMER_ID, CUSTOMER_NAME, TAX_ID, EMAIL, CITY, REGION,
+                          COUNTRY, CUSTOMER_GROUP, CREATED_DATE, ROW_HASH)
+SELECT CUSTOMER_ID, CUSTOMER_NAME, TAX_ID, EMAIL, CITY, REGION,
+       COUNTRY, CUSTOMER_GROUP, CREATED_DATE, ROW_HASH
+FROM DWH_DEMO.STAGING.STG_CUSTOMERS;
+
+-- Procedimiento SCD2 (para demo de "el cliente cambió de grupo/ciudad")
+CREATE OR REPLACE PROCEDURE SP_MERGE_DIM_CUSTOMER()
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+BEGIN
+    -- 1) Cerrar versiones vigentes cuyo hash cambió
+    UPDATE DIM_CUSTOMER d
+    SET VALID_TO = CURRENT_TIMESTAMP(), IS_CURRENT = FALSE, _UPDATED_AT = CURRENT_TIMESTAMP()
+    FROM DWH_DEMO.STAGING.STG_CUSTOMERS s
+    WHERE d.CUSTOMER_ID = s.CUSTOMER_ID
+      AND d.IS_CURRENT = TRUE
+      AND d.ROW_HASH  <> s.ROW_HASH;
+
+    -- 2) Insertar versiones nuevas (cambios) y altas
+    INSERT INTO DIM_CUSTOMER (CUSTOMER_ID, CUSTOMER_NAME, TAX_ID, EMAIL, CITY, REGION,
+                              COUNTRY, CUSTOMER_GROUP, CREATED_DATE, ROW_HASH)
+    SELECT s.CUSTOMER_ID, s.CUSTOMER_NAME, s.TAX_ID, s.EMAIL, s.CITY, s.REGION,
+           s.COUNTRY, s.CUSTOMER_GROUP, s.CREATED_DATE, s.ROW_HASH
+    FROM DWH_DEMO.STAGING.STG_CUSTOMERS s
+    LEFT JOIN DIM_CUSTOMER d
+      ON d.CUSTOMER_ID = s.CUSTOMER_ID AND d.IS_CURRENT = TRUE
+    WHERE d.CUSTOMER_ID IS NULL;
+
+    RETURN 'SCD2 DIM_CUSTOMER: OK';
+END;
+
+-- -----------------------------------------------------------
+-- 4.3 DIM_PRODUCT — SCD Tipo 2 (misma mecánica)
+-- -----------------------------------------------------------
+CREATE OR REPLACE TABLE DIM_PRODUCT (
+    PRODUCT_SK    NUMBER IDENTITY,
+    PRODUCT_ID    VARCHAR NOT NULL,
+    PRODUCT_NAME  VARCHAR,
+    PRODUCT_TYPE  VARCHAR,
+    PRODUCT_LINE  VARCHAR,
+    BASE_UOM      VARCHAR,
+    DIVISION_ID   VARCHAR,
+    ROW_HASH      VARCHAR,
+    VALID_FROM    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    VALID_TO      TIMESTAMP_NTZ DEFAULT '9999-12-31'::TIMESTAMP_NTZ,
+    IS_CURRENT    BOOLEAN DEFAULT TRUE,
+    _CREATED_AT   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    _UPDATED_AT   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+INSERT INTO DIM_PRODUCT (PRODUCT_ID, PRODUCT_NAME, PRODUCT_TYPE, PRODUCT_LINE,
+                         BASE_UOM, DIVISION_ID, ROW_HASH)
+SELECT PRODUCT_ID, PRODUCT_NAME, PRODUCT_TYPE, PRODUCT_LINE, BASE_UOM, DIVISION_ID, ROW_HASH
+FROM DWH_DEMO.STAGING.STG_MATERIALS;
+
+-- -----------------------------------------------------------
+-- 4.4 DIM_SALES_ORG (SCD1, chica)
+-- -----------------------------------------------------------
+CREATE OR REPLACE TABLE DIM_SALES_ORG AS
+SELECT ROW_NUMBER() OVER (ORDER BY SALES_ORG_ID, CHANNEL_ID, DIVISION_ID) AS SALES_ORG_SK,
+       SALES_ORG_ID, SALES_ORG_NAME, CHANNEL_ID, CHANNEL_NAME, DIVISION_ID, DIVISION_NAME
+FROM DWH_DEMO.STAGING.STG_SALES_ORG;
+
+-- -----------------------------------------------------------
+-- 4.5 FACT_SALES_ORDERS — grano: posición de orden
+--     MERGE idempotente por clave natural (reprocesar no duplica)
+-- -----------------------------------------------------------
+CREATE OR REPLACE TABLE FACT_SALES_ORDERS (
+    ORDER_ID       VARCHAR,
+    ITEM_NO        VARCHAR,
+    DATE_SK        NUMBER,
+    CUSTOMER_SK    NUMBER,
+    PRODUCT_SK     NUMBER,
+    SALES_ORG_SK   NUMBER,
+    QUANTITY       NUMBER(18,3),
+    NET_AMOUNT     NUMBER(18,2),
+    CURRENCY       VARCHAR,
+    _LOADED_AT     TIMESTAMP_NTZ,
+    _CREATED_AT    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_FSO PRIMARY KEY (ORDER_ID, ITEM_NO)
+);
+
+MERGE INTO FACT_SALES_ORDERS f
+USING (
+    SELECT
+        s.ORDER_ID, s.ITEM_NO,
+        TO_NUMBER(TO_CHAR(s.ORDER_DATE,'YYYYMMDD'))        AS DATE_SK,
+        c.CUSTOMER_SK, p.PRODUCT_SK, o.SALES_ORG_SK,
+        s.QUANTITY, s.NET_AMOUNT, s.CURRENCY, s._LOADED_AT
+    FROM DWH_DEMO.STAGING.STG_SALES_ORDERS s
+    LEFT JOIN DIM_CUSTOMER  c ON c.CUSTOMER_ID = s.CUSTOMER_ID AND c.IS_CURRENT
+    LEFT JOIN DIM_PRODUCT   p ON p.PRODUCT_ID  = s.PRODUCT_ID  AND p.IS_CURRENT
+    LEFT JOIN DIM_SALES_ORG o ON o.SALES_ORG_ID = s.SALES_ORG_ID
+                             AND o.CHANNEL_ID   = s.CHANNEL_ID
+                             AND o.DIVISION_ID  = s.DIVISION_ID
+    WHERE s.ORDER_DATE IS NOT NULL          -- las fechas basura van a cuarentena en Fase 3
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY s.ORDER_ID, s.ITEM_NO ORDER BY s._LOADED_AT DESC) = 1
+) src
+ON f.ORDER_ID = src.ORDER_ID AND f.ITEM_NO = src.ITEM_NO
+WHEN MATCHED THEN UPDATE SET
+    f.DATE_SK = src.DATE_SK, f.CUSTOMER_SK = src.CUSTOMER_SK,
+    f.PRODUCT_SK = src.PRODUCT_SK, f.SALES_ORG_SK = src.SALES_ORG_SK,
+    f.QUANTITY = src.QUANTITY, f.NET_AMOUNT = src.NET_AMOUNT,
+    f._LOADED_AT = src._LOADED_AT
+WHEN NOT MATCHED THEN INSERT
+    (ORDER_ID, ITEM_NO, DATE_SK, CUSTOMER_SK, PRODUCT_SK, SALES_ORG_SK,
+     QUANTITY, NET_AMOUNT, CURRENCY, _LOADED_AT)
+VALUES
+    (src.ORDER_ID, src.ITEM_NO, src.DATE_SK, src.CUSTOMER_SK, src.PRODUCT_SK,
+     src.SALES_ORG_SK, src.QUANTITY, src.NET_AMOUNT, src.CURRENCY, src._LOADED_AT);
+
+-- -----------------------------------------------------------
+-- 4.6 FACT_BILLING — grano: posición de factura
+-- -----------------------------------------------------------
+CREATE OR REPLACE TABLE FACT_BILLING (
+    BILLING_ID     VARCHAR,
+    ITEM_NO        VARCHAR,
+    DATE_SK        NUMBER,
+    CUSTOMER_SK    NUMBER,
+    PRODUCT_SK     NUMBER,
+    SALES_ORG_ID   VARCHAR,
+    QUANTITY       NUMBER(18,3),
+    NET_AMOUNT     NUMBER(18,2),
+    CURRENCY       VARCHAR,
+    REF_ORDER_ID   VARCHAR,
+    _LOADED_AT     TIMESTAMP_NTZ,
+    _CREATED_AT    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_FB PRIMARY KEY (BILLING_ID, ITEM_NO)
+);
+
+MERGE INTO FACT_BILLING f
+USING (
+    SELECT b.BILLING_ID, b.ITEM_NO,
+           TO_NUMBER(TO_CHAR(b.BILLING_DATE,'YYYYMMDD')) AS DATE_SK,
+           c.CUSTOMER_SK, p.PRODUCT_SK, b.SALES_ORG_ID,
+           b.QUANTITY, b.NET_AMOUNT, b.CURRENCY, b.REF_ORDER_ID, b._LOADED_AT
+    FROM DWH_DEMO.STAGING.STG_BILLING b
+    LEFT JOIN DIM_CUSTOMER c ON c.CUSTOMER_ID = b.CUSTOMER_ID AND c.IS_CURRENT
+    LEFT JOIN DIM_PRODUCT  p ON p.PRODUCT_ID  = b.PRODUCT_ID  AND p.IS_CURRENT
+    WHERE b.BILLING_DATE IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY b.BILLING_ID, b.ITEM_NO ORDER BY b._LOADED_AT DESC) = 1
+) src
+ON f.BILLING_ID = src.BILLING_ID AND f.ITEM_NO = src.ITEM_NO
+WHEN MATCHED THEN UPDATE SET f.NET_AMOUNT = src.NET_AMOUNT, f._LOADED_AT = src._LOADED_AT
+WHEN NOT MATCHED THEN INSERT
+    (BILLING_ID, ITEM_NO, DATE_SK, CUSTOMER_SK, PRODUCT_SK, SALES_ORG_ID,
+     QUANTITY, NET_AMOUNT, CURRENCY, REF_ORDER_ID, _LOADED_AT)
+VALUES
+    (src.BILLING_ID, src.ITEM_NO, src.DATE_SK, src.CUSTOMER_SK, src.PRODUCT_SK,
+     src.SALES_ORG_ID, src.QUANTITY, src.NET_AMOUNT, src.CURRENCY, src.REF_ORDER_ID, src._LOADED_AT);
+
+-- -----------------------------------------------------------
+-- 4.7 FACT_BUDGET — presupuesto (el "Excel" ya gobernado)
+-- -----------------------------------------------------------
+CREATE OR REPLACE TABLE FACT_BUDGET AS
+SELECT BUDGET_YEAR, BUDGET_MONTH, SALES_ORG_ID, PRODUCT_LINE, BUDGET_AMOUNT
+FROM DWH_DEMO.STAGING.STG_BUDGET;
+
+-- -----------------------------------------------------------
+-- 4.8 Vistas de consumo para Power BI (KPIs de la demo)
+-- -----------------------------------------------------------
+CREATE OR REPLACE VIEW V_VENTAS_MENSUALES AS
+SELECT d.YEAR, d.MONTH, o.SALES_ORG_NAME, p.PRODUCT_LINE,
+       SUM(f.NET_AMOUNT) AS VENTA_NETA, SUM(f.QUANTITY) AS CANTIDAD
+FROM FACT_BILLING f
+JOIN DIM_DATE d      ON d.DATE_SK = f.DATE_SK
+JOIN DIM_PRODUCT p   ON p.PRODUCT_SK = f.PRODUCT_SK
+JOIN DIM_SALES_ORG o ON o.SALES_ORG_ID = f.SALES_ORG_ID
+GROUP BY 1,2,3,4;
+
+CREATE OR REPLACE VIEW V_CUMPLIMIENTO_PPTO AS
+SELECT v.YEAR, v.MONTH, v.PRODUCT_LINE,
+       SUM(v.VENTA_NETA)                       AS REAL,
+       SUM(b.BUDGET_AMOUNT)                    AS PRESUPUESTO,
+       ROUND(SUM(v.VENTA_NETA) / NULLIF(SUM(b.BUDGET_AMOUNT),0) * 100, 1) AS CUMPLIMIENTO_PCT
+FROM V_VENTAS_MENSUALES v
+JOIN FACT_BUDGET b
+  ON b.BUDGET_YEAR = v.YEAR AND b.BUDGET_MONTH = v.MONTH AND b.PRODUCT_LINE = v.PRODUCT_LINE
+GROUP BY 1,2,3;
+
+-- Chequeo
+SELECT 'FACT_SALES_ORDERS' t, COUNT(*) FROM FACT_SALES_ORDERS
+UNION ALL SELECT 'FACT_BILLING', COUNT(*) FROM FACT_BILLING
+UNION ALL SELECT 'DIM_CUSTOMER', COUNT(*) FROM DIM_CUSTOMER
+UNION ALL SELECT 'DIM_PRODUCT', COUNT(*) FROM DIM_PRODUCT;

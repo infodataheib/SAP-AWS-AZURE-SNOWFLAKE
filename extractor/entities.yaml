@@ -1,0 +1,81 @@
+# entities.yaml — DataHeiß · configuración de entidades a extraer
+#
+# Un archivo por ambiente. Este trae DOS perfiles de ejemplo:
+#   (1) ES5 (Gateway Demo público de SAP) — para desarrollar la mecánica
+#       OData a costo cero. Registro: ver README (links).
+#   (2) S/4HANA (CAL appliance o el RISE de un cliente) — las APIs
+#       estándar de ventas. Ajustar entity sets según las CDS liberadas.
+#
+# rename: campo OData → nombre de columna en la tabla RAW de Snowflake.
+# incremental_field: campo datetime para el watermark (delta). Si la
+#   entidad no lo tiene, se omite y esa entidad va siempre full.
+# -----------------------------------------------------------------------
+
+# ==== PERFIL 1 · Sandbox SAP Business Accelerator Hub (desarrollo) ====
+# NOTA: ES5 fue discontinuado (el registro está deshabilitado). El
+# reemplazo para la Etapa A es el sandbox de api.sap.com: mismas APIs
+# que el perfil S/4HANA de abajo, solo lectura, autenticación por
+# header APIKey (cuenta SAP gratuita → botón "Get API Key" en api.sap.com).
+# base_url: https://sandbox.api.sap.com/s4hanacloud/sap/opu/odata/sap/API_SALES_ORDER_SRV
+# auth: api_key  (en el secreto: {"base_url": "...", "api_key": "<tu key>"})
+# Las entidades y renames del perfil 2 aplican tal cual — es la
+# misma API. Limitaciones del sandbox: solo lectura, datos mock
+# acotados, sin garantía de delta → el watermark se prueba igual
+# (segunda corrida trae 0 filas) pero el incremental real se valida
+# recién contra el CAL en la Etapa D.
+
+# ============ PERFIL 2 · S/4HANA (CAL / RISE) ============
+# base_url ejemplo CAL: https://<host>:44300/sap/opu/odata/sap/API_SALES_ORDER_SRV
+# Nota: cada API estándar es un servicio distinto; el extractor se
+# instancia una vez por servicio (ver handler: lista de configs).
+entities:
+  - name: sales_orders
+    entity_set: A_SalesOrderItem            # API_SALES_ORDER_SRV
+    rename:
+      SalesOrder:               VBELN
+      SalesOrderItem:           POSNR
+      CreationDate:             AUDAT
+      SoldToParty:              KUNNR
+      Material:                 MATNR
+      SalesOrganization:        VKORG
+      DistributionChannel:      VTWEG
+      Division:                 SPART
+      RequestedQuantity:        KWMENG
+      NetAmount:                NETWR
+      TransactionCurrency:      WAERK
+    incremental_field: LastChangeDateTime
+
+  - name: billing
+    entity_set: A_BillingDocumentItem       # API_BILLING_DOCUMENT_SRV
+    rename:
+      BillingDocument:          VBELN
+      BillingDocumentItem:      POSNR
+      CreationDate:             FKDAT
+      SoldToParty:              KUNAG
+      Material:                 MATNR
+      SalesOrganization:        VKORG
+      BillingQuantity:          FKIMG
+      NetAmount:                NETWR
+      TransactionCurrency:      WAERK
+      ReferenceSDDocument:      AUBEL
+    incremental_field: LastChangeDateTime
+
+  - name: customers
+    entity_set: A_BusinessPartner           # API_BUSINESS_PARTNER
+    rename:
+      BusinessPartner:          KUNNR
+      OrganizationBPName1:      NAME1
+      # RUC/tax y email viven en sub-entidades (A_BusinessPartnerTaxNumber,
+      # A_AddressEmailAddress); para la práctica alcanza con lo de arriba
+      # o expandir con $expand en una iteración posterior.
+    incremental_field: LastChangeDate
+
+  - name: materials
+    entity_set: A_Product                   # API_PRODUCT_SRV
+    rename:
+      Product:                  MATNR
+      ProductType:              MTART
+      ProductGroup:             MATKL
+      BaseUnit:                 MEINS
+      Division:                 SPART
+    incremental_field: LastChangeDateTime
