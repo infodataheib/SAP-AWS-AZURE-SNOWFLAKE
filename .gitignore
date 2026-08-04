@@ -1,0 +1,19 @@
+# Python / Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Local data & temporary files
+*.parquet
+/tmp/
+*.json
+*.csv
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+.env
